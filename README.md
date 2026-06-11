@@ -46,7 +46,7 @@ A production-grade, distributed, event-driven order processing platform built wi
 ### 1. Start the platform
 
 ```powershell
-cd C:\GPP\event-driven-order-processing-platform
+cd C:\event-driven-order-processing-platform
 docker compose up --build
 ```
 
