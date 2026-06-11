@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "inventory.reservation_failed",
+  "type": "object",
+  "required": ["eventId","eventType","occurredAt","orderId","reason","schemaVersion"],
+  "properties": {
+    "eventId": {"type":"string","format":"uuid"},
+    "eventType": {"type":"string","const":"INVENTORY_RESERVATION_FAILED"},
+    "occurredAt": {"type":"string","format":"date-time"},
+    "orderId": {"type":"string","format":"uuid"},
+    "reason": {"type":"string"},
+    "schemaVersion": {"type":"string","const":"1.0"}
+  }
+}

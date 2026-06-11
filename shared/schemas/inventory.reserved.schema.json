@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "inventory.reserved",
+  "type": "object",
+  "required": ["eventId","eventType","occurredAt","orderId","reservations","schemaVersion"],
+  "properties": {
+    "eventId": {"type":"string","format":"uuid"},
+    "eventType": {"type":"string","const":"INVENTORY_RESERVED"},
+    "occurredAt": {"type":"string","format":"date-time"},
+    "orderId": {"type":"string","format":"uuid"},
+    "reservations": {"type":"array","items": {"type":"object","required":["productId","quantity"],"properties":{"productId":{"type":"string","format":"uuid"},"quantity":{"type":"integer","minimum":1}}}},
+    "schemaVersion": {"type":"string","const":"1.0"}
+  }
+}

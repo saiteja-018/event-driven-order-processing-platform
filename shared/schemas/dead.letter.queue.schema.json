@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "dead.letter.queue",
+  "type": "object",
+  "required": ["originalTopic","originalPartition","originalOffset","failedAt","errorMessage","retryCount","payload","schemaVersion"],
+  "properties": {
+    "originalTopic": {"type":"string"},
+    "originalPartition": {"type":"integer"},
+    "originalOffset": {"type":"string"},
+    "failedAt": {"type":"string","format":"date-time"},
+    "errorMessage": {"type":"string"},
+    "retryCount": {"type":"integer"},
+    "payload": {"type":"object"},
+    "schemaVersion": {"type":"string","const":"1.0"}
+  }
+}

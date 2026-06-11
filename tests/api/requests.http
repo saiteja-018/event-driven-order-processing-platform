@@ -1,0 +1,156 @@
+### Event-Driven Order Processing Platform — API Test Collection
+### All requests target the API Gateway at http://localhost:3000
+
+### ─── Health Check ─────────────────────────────────────────────────────────────
+
+GET http://localhost:3000/api/v1/health
+X-Request-ID: test-health-001
+
+###
+
+### ─── Products ──────────────────────────────────────────────────────────────────
+
+### List all products
+GET http://localhost:3000/api/v1/products
+X-Request-ID: test-products-001
+
+###
+
+### List in-stock products only
+GET http://localhost:3000/api/v1/products?inStockOnly=true&page=1&limit=10
+X-Request-ID: test-products-002
+
+###
+
+### Get a single product (replace {productId} with a real UUID from /products)
+# GET http://localhost:3000/api/v1/products/{productId}
+# X-Request-ID: test-product-003
+
+###
+
+### ─── Orders ────────────────────────────────────────────────────────────────────
+
+### Create a new order (replace productId with a real UUID from /api/v1/products)
+POST http://localhost:3000/api/v1/orders
+Content-Type: application/json
+X-Request-ID: test-order-create-001
+
+{
+  "userId": "550e8400-e29b-41d4-a716-446655440001",
+  "items": [
+    {
+      "productId": "REPLACE_WITH_REAL_PRODUCT_ID",
+      "quantity": 1,
+      "unitPrice": 99.99
+    }
+  ],
+  "totalAmount": 99.99,
+  "currency": "USD",
+  "idempotencyKey": "test-idem-key-001"
+}
+
+###
+
+### Replay same order (idempotency test — should return HTTP 200 with same order)
+POST http://localhost:3000/api/v1/orders
+Content-Type: application/json
+X-Request-ID: test-order-replay-001
+
+{
+  "userId": "550e8400-e29b-41d4-a716-446655440001",
+  "items": [
+    {
+      "productId": "REPLACE_WITH_REAL_PRODUCT_ID",
+      "quantity": 1,
+      "unitPrice": 99.99
+    }
+  ],
+  "totalAmount": 99.99,
+  "currency": "USD",
+  "idempotencyKey": "test-idem-key-001"
+}
+
+###
+
+### Create order that always fails payment (totalAmount > 10000)
+POST http://localhost:3000/api/v1/orders
+Content-Type: application/json
+X-Request-ID: test-order-payment-fail-001
+
+{
+  "userId": "550e8400-e29b-41d4-a716-446655440002",
+  "items": [
+    {
+      "productId": "REPLACE_WITH_REAL_PRODUCT_ID",
+      "quantity": 1,
+      "unitPrice": 15000
+    }
+  ],
+  "totalAmount": 15000,
+  "currency": "USD",
+  "idempotencyKey": "test-idem-key-payment-fail-001"
+}
+
+###
+
+### Create order with zero-stock product (should reach CANCELLED)
+POST http://localhost:3000/api/v1/orders
+Content-Type: application/json
+X-Request-ID: test-order-no-stock-001
+
+{
+  "userId": "550e8400-e29b-41d4-a716-446655440003",
+  "items": [
+    {
+      "productId": "REPLACE_WITH_ZERO_STOCK_PRODUCT_ID",
+      "quantity": 1,
+      "unitPrice": 10
+    }
+  ],
+  "totalAmount": 10,
+  "currency": "USD",
+  "idempotencyKey": "test-idem-key-no-stock-001"
+}
+
+###
+
+### Get order by ID (replace {orderId} with a real order UUID)
+# GET http://localhost:3000/api/v1/orders/{orderId}
+# X-Request-ID: test-order-get-001
+
+###
+
+### Get all orders for a user
+# GET http://localhost:3000/api/v1/orders/user/550e8400-e29b-41d4-a716-446655440001?page=1&limit=20
+# X-Request-ID: test-orders-user-001
+
+###
+
+### Cancel an order (replace {orderId} with a real order UUID in PENDING state)
+# DELETE http://localhost:3000/api/v1/orders/{orderId}
+# X-Request-ID: test-order-cancel-001
+
+###
+
+### ─── Analytics ─────────────────────────────────────────────────────────────────
+
+### Get hourly metrics (adjust from/to to the past 24 hours)
+GET http://localhost:3000/api/v1/analytics/metrics?from=2024-01-01T00:00:00Z&to=2024-01-01T23:59:59Z
+X-Request-ID: test-analytics-metrics-001
+
+###
+
+### Get analytics events for a specific order (replace {orderId})
+# GET http://localhost:3000/api/v1/analytics/events?orderId={orderId}
+# X-Request-ID: test-analytics-events-001
+
+###
+
+### ─── Rate Limiting Test (429) ──────────────────────────────────────────────────
+### Send this request 101+ times from the same userId header to trigger rate limiting
+
+GET http://localhost:3000/api/v1/health
+X-User-Id: rate-limit-test-user-001
+X-Request-ID: test-rate-limit-001
+
+###

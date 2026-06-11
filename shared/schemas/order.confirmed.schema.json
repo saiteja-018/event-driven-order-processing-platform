@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "order.confirmed",
+  "type": "object",
+  "required": ["eventId","eventType","occurredAt","orderId","schemaVersion"],
+  "properties": {
+    "eventId": {"type":"string","format":"uuid"},
+    "eventType": {"type":"string","const":"ORDER_CONFIRMED"},
+    "occurredAt": {"type":"string","format":"date-time"},
+    "orderId": {"type":"string","format":"uuid"},
+    "userId": {"type":"string","format":"uuid"},
+    "totalAmount": {"type":"number"},
+    "currency": {"type":"string","minLength":3,"maxLength":3},
+    "schemaVersion": {"type":"string","const":"1.0"}
+  }
+}

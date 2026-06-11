@@ -1,0 +1,7 @@
+node_modules
+dist
+.env
+.env.local
+postgres-data
+redis-data
+localstack-data

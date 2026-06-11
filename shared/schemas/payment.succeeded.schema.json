@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "payment.succeeded",
+  "type": "object",
+  "required": ["eventId","eventType","occurredAt","transactionId","orderId","amount","currency","providerReference","schemaVersion"],
+  "properties": {
+    "eventId": {"type":"string","format":"uuid"},
+    "eventType": {"type":"string","const":"PAYMENT_SUCCEEDED"},
+    "occurredAt": {"type":"string","format":"date-time"},
+    "transactionId": {"type":"string","format":"uuid"},
+    "orderId": {"type":"string","format":"uuid"},
+    "amount": {"type":"number"},
+    "currency": {"type":"string","minLength":3,"maxLength":3},
+    "providerReference": {"type":"string"},
+    "schemaVersion": {"type":"string","const":"1.0"}
+  }
+}

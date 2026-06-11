@@ -1,0 +1,10 @@
+{
+  "name": "process-payment-lambda",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "kafkajs": "^2.2.4",
+    "pg": "^8.10.0",
+    "aws-sdk": "^2.1450.0"
+  }
+}

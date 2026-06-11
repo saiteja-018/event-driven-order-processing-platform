@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "payment.initiated",
+  "type": "object",
+  "required": ["eventId","eventType","occurredAt","transactionId","orderId","amount","currency","schemaVersion"],
+  "properties": {
+    "eventId": {"type":"string","format":"uuid"},
+    "eventType": {"type":"string","const":"PAYMENT_INITIATED"},
+    "occurredAt": {"type":"string","format":"date-time"},
+    "transactionId": {"type":"string","format":"uuid"},
+    "orderId": {"type":"string","format":"uuid"},
+    "amount": {"type":"number"},
+    "currency": {"type":"string","minLength":3,"maxLength":3},
+    "userId": {"type":"string","format":"uuid"},
+    "schemaVersion": {"type":"string","const":"1.0"}
+  }
+}

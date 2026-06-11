@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "order.cancelled",
+  "type": "object",
+  "required": ["eventId","eventType","occurredAt","orderId","schemaVersion"],
+  "properties": {
+    "eventId": {"type":"string","format":"uuid"},
+    "eventType": {"type":"string","const":"ORDER_CANCELLED"},
+    "occurredAt": {"type":"string","format":"date-time"},
+    "orderId": {"type":"string","format":"uuid"},
+    "reason": {"type":"string"},
+    "schemaVersion": {"type":"string","const":"1.0"}
+  }
+}
