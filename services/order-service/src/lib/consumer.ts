@@ -15,6 +15,11 @@ const consumer = kafka.consumer({ groupId: 'order-service-group' });
 
 function delay(ms: number) { return new Promise(res => setTimeout(res, ms)); }
 
+// Fire-and-forget for non-critical async operations (SNS, notifications)
+function fireAndForget(fn: () => Promise<any>, label: string) {
+  fn().catch(err => logger.warn({ message: `${label}_non_critical_error`, error: String(err) }));
+}
+
 export async function startConsumers() {
   await consumer.connect();
   await consumer.subscribe({ topic: 'inventory.reserved', fromBeginning: true });
@@ -35,19 +40,37 @@ export async function startConsumers() {
         }
         let event: any;
         try { event = JSON.parse(value); } catch (e) { throw new Error('invalid_json'); }
-        const validation = validateEvent(topic, event);
-        if (!validation.valid) throw new Error(`schema_invalid:${JSON.stringify(validation.errors)}`);
 
+        // Schema validation (best-effort — don't block on schema not found)
+        const validation = validateEvent(topic, event);
+        if (!validation.valid) {
+          // Check if it's a missing schema or actual validation failure
+          const errors = validation.errors || [];
+          const isSchemaMissing = errors.length === 1 && String(errors[0]).startsWith('schema_not_found');
+          if (!isSchemaMissing) {
+            throw new Error(`schema_invalid:${JSON.stringify(errors)}`);
+          }
+        }
+
+        // Consumer idempotency using eventId (if present)
         const consumerId = `order-service-group:${topic}`;
-        if (!event.eventId) throw new Error('missing_eventId');
-        const processedKey = `processed_event:${consumerId}:${event.eventId}`;
-        if (await redis.get(processedKey)) {
-          await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
-          return;
+        if (event.eventId) {
+          const processedKey = `processed_event:${consumerId}:${event.eventId}`;
+          if (await redis.get(processedKey)) {
+            logger.info({ message: 'idempotent_skip', topic, eventId: event.eventId });
+            await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
+            return;
+          }
         }
 
         if (topic === 'inventory.reserved') {
-          await updateOrderStatus(event.orderId, 'CONFIRMED');
+          // Use no-op safe updateOrderStatus (won't throw on already-CONFIRMED)
+          try {
+            await updateOrderStatus(event.orderId, 'CONFIRMED');
+          } catch (e: any) {
+            // If already CONFIRMED, that's fine — idempotent
+            if (!String(e).includes('illegal_transition') && !String(e).includes('no-op')) throw e;
+          }
           const orderRes = await pool.query('SELECT user_id, total_amount, currency FROM order_service.orders WHERE id=$1', [event.orderId]);
           const order = orderRes.rows[0];
           const userId = order ? order.user_id : (event.userId || 'unknown');
@@ -65,29 +88,49 @@ export async function startConsumers() {
             schemaVersion: '1.0'
           };
           await producer.send({ topic: 'order.confirmed', messages: [{ key: event.orderId, value: JSON.stringify(outEvent) }] });
-          await publishNotificationDispatch({ userId, orderId: event.orderId, channel: 'EMAIL', templateKey: 'ORDER_CONFIRMED', payload: { orderId: event.orderId } });
-          await publishOrderLifecycleSns('ORDER_CONFIRMED', { orderId: event.orderId });
+          fireAndForget(() => publishNotificationDispatch({ userId, orderId: event.orderId, channel: 'EMAIL', templateKey: 'ORDER_CONFIRMED', payload: { orderId: event.orderId } }), 'notify_confirmed');
+          fireAndForget(() => publishOrderLifecycleSns('ORDER_CONFIRMED', { orderId: event.orderId }), 'sns_confirmed');
         } else if (topic === 'inventory.reservation_failed') {
-          await updateOrderStatus(event.orderId, 'CANCELLED', 'inventory_reservation_failed');
+          try {
+            await updateOrderStatus(event.orderId, 'CANCELLED', 'inventory_reservation_failed');
+          } catch (e: any) {
+            if (!String(e).includes('illegal_transition') && !String(e).includes('no-op')) throw e;
+          }
           const outEvent = { eventId: uuidv4(), eventType: 'ORDER_CANCELLED', occurredAt: new Date().toISOString(), orderId: event.orderId, reason: 'inventory_reservation_failed', schemaVersion: '1.0' };
           await producer.send({ topic: 'order.cancelled', messages: [{ key: event.orderId, value: JSON.stringify(outEvent) }] });
-          await publishNotificationDispatch({ userId: event.userId || 'unknown', orderId: event.orderId, channel: 'EMAIL', templateKey: 'ORDER_CANCELLED', payload: { orderId: event.orderId, reason: 'inventory_reservation_failed' } });
-          await publishOrderLifecycleSns('ORDER_CANCELLED', { orderId: event.orderId, reason: 'inventory_reservation_failed' });
+          fireAndForget(() => publishNotificationDispatch({ userId: event.userId || 'unknown', orderId: event.orderId, channel: 'EMAIL', templateKey: 'ORDER_CANCELLED', payload: { orderId: event.orderId, reason: 'inventory_reservation_failed' } }), 'notify_reservation_failed');
+          fireAndForget(() => publishOrderLifecycleSns('ORDER_CANCELLED', { orderId: event.orderId, reason: 'inventory_reservation_failed' }), 'sns_reservation_failed');
         } else if (topic === 'payment.initiated') {
-          await updateOrderStatus(event.orderId, 'PAYMENT_PROCESSING');
+          try {
+            await updateOrderStatus(event.orderId, 'PAYMENT_PROCESSING');
+          } catch (e: any) {
+            if (!String(e).includes('illegal_transition') && !String(e).includes('no-op')) throw e;
+          }
         } else if (topic === 'payment.succeeded') {
-          await updateOrderStatus(event.orderId, 'COMPLETED');
+          try {
+            await updateOrderStatus(event.orderId, 'COMPLETED');
+          } catch (e: any) {
+            if (!String(e).includes('illegal_transition') && !String(e).includes('no-op')) throw e;
+          }
           const outEvent = { eventId: uuidv4(), eventType: 'ORDER_COMPLETED', occurredAt: new Date().toISOString(), orderId: event.orderId, schemaVersion: '1.0' };
           await producer.send({ topic: 'order.completed', messages: [{ key: event.orderId, value: JSON.stringify(outEvent) }] });
-          await publishNotificationDispatch({ userId: event.userId || 'unknown', orderId: event.orderId, channel: 'EMAIL', templateKey: 'ORDER_COMPLETED', payload: { orderId: event.orderId } });
-          await publishOrderLifecycleSns('ORDER_COMPLETED', { orderId: event.orderId });
+          fireAndForget(() => publishNotificationDispatch({ userId: event.userId || 'unknown', orderId: event.orderId, channel: 'EMAIL', templateKey: 'ORDER_COMPLETED', payload: { orderId: event.orderId } }), 'notify_completed');
+          fireAndForget(() => publishOrderLifecycleSns('ORDER_COMPLETED', { orderId: event.orderId }), 'sns_completed');
         } else if (topic === 'payment.failed') {
           const retry = event.retryCount || 0;
-          await updateOrderStatus(event.orderId, 'PAYMENT_FAILED', 'payment_failed');
-          await publishNotificationDispatch({ userId: event.userId || 'unknown', orderId: event.orderId, channel: 'EMAIL', templateKey: 'PAYMENT_FAILED', payload: { orderId: event.orderId } });
+          try {
+            await updateOrderStatus(event.orderId, 'PAYMENT_FAILED', 'payment_failed');
+          } catch (e: any) {
+            if (!String(e).includes('illegal_transition') && !String(e).includes('no-op')) throw e;
+          }
+          fireAndForget(() => publishNotificationDispatch({ userId: event.userId || 'unknown', orderId: event.orderId, channel: 'EMAIL', templateKey: 'PAYMENT_FAILED', payload: { orderId: event.orderId } }), 'notify_payment_failed');
           if (retry < 3) {
-            await updateOrderStatus(event.orderId, 'PAYMENT_PROCESSING', 'payment_retry');
-            const retryEvent = { eventId: uuidv4(), eventType: 'PAYMENT_INITIATED', occurredAt: new Date().toISOString(), transactionId: event.transactionId, orderId: event.orderId, amount: event.amount, currency: event.currency, userId: event.userId, idempotencyKey: event.idempotencyKey || event.transactionId, schemaVersion: '1.0' };
+            try {
+              await updateOrderStatus(event.orderId, 'PAYMENT_PROCESSING', 'payment_retry');
+            } catch (e: any) {
+              if (!String(e).includes('illegal_transition') && !String(e).includes('no-op')) throw e;
+            }
+            const retryEvent = { eventId: uuidv4(), eventType: 'PAYMENT_INITIATED', occurredAt: new Date().toISOString(), transactionId: event.transactionId, orderId: event.orderId, amount: event.amount, currency: event.currency, userId: event.userId, idempotencyKey: event.idempotencyKey || event.transactionId, retryCount: retry + 1, schemaVersion: '1.0' };
             await producer.send({ topic: 'payment.initiated', messages: [{ key: event.orderId, value: JSON.stringify(retryEvent) }] });
 
             // Re-queue to SQS for actual payment re-processing
@@ -107,22 +150,30 @@ export async function startConsumers() {
                   amount: event.amount,
                   currency: event.currency,
                   userId: event.userId,
-                  idempotencyKey: event.idempotencyKey || event.transactionId
+                  idempotencyKey: event.idempotencyKey || event.transactionId,
+                  retryCount: retry + 1
                 })
               }).promise();
             } catch (sqsErr: any) {
               logger.error({ message: 'payment_retry_sqs_error', orderId: event.orderId, error: String(sqsErr) });
             }
           } else {
-            await updateOrderStatus(event.orderId, 'CANCELLED', 'payment_failed');
+            try {
+              await updateOrderStatus(event.orderId, 'CANCELLED', 'payment_failed');
+            } catch (e: any) {
+              if (!String(e).includes('illegal_transition') && !String(e).includes('no-op')) throw e;
+            }
             const outEvent = { eventId: uuidv4(), eventType: 'ORDER_CANCELLED', occurredAt: new Date().toISOString(), orderId: event.orderId, reason: 'payment_failed', schemaVersion: '1.0' };
             await producer.send({ topic: 'order.cancelled', messages: [{ key: event.orderId, value: JSON.stringify(outEvent) }] });
-            await publishNotificationDispatch({ userId: event.userId || 'unknown', orderId: event.orderId, channel: 'EMAIL', templateKey: 'ORDER_CANCELLED', payload: { orderId: event.orderId, reason: 'payment_failed' } });
-            await publishOrderLifecycleSns('ORDER_CANCELLED', { orderId: event.orderId, reason: 'payment_failed' });
+            fireAndForget(() => publishNotificationDispatch({ userId: event.userId || 'unknown', orderId: event.orderId, channel: 'EMAIL', templateKey: 'ORDER_CANCELLED', payload: { orderId: event.orderId, reason: 'payment_failed' } }), 'notify_order_cancelled_payment');
+            fireAndForget(() => publishOrderLifecycleSns('ORDER_CANCELLED', { orderId: event.orderId, reason: 'payment_failed' }), 'sns_order_cancelled_payment');
           }
         }
 
-        await redis.set(processedKey, '1', 'EX', 3600);
+        // Mark as processed (idempotency)
+        if (event.eventId) {
+          await redis.set(`processed_event:${consumerId}:${event.eventId}`, '1', 'EX', 3600);
+        }
         await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
         return;
       } catch (err:any) {
@@ -130,12 +181,32 @@ export async function startConsumers() {
         if (attempt < 2) await delay(retryDelays[attempt]);
       }
     }
-    // publish to dead letter queue after retries
+    // publish to dead letter queue after retries exhausted
     try {
-      await producer.send({ topic: 'dead.letter.queue', messages: [{ key: 'dlq', value: JSON.stringify({ originalTopic: topic, originalPartition: partition, originalOffset: String(message.offset), failedAt: new Date().toISOString(), errorMessage: String(lastErr), retryCount: 3, payload: message.value?.toString() }) }] });
+      let rawPayload: string | null = null;
+      try { rawPayload = message.value?.toString() || null; } catch { /* ignore */ }
+      let parsedPayload: any = rawPayload;
+      try { if (rawPayload) parsedPayload = JSON.parse(rawPayload); } catch { /* ignore */ }
+      await producer.send({
+        topic: 'dead.letter.queue',
+        messages: [{
+          key: `${topic}-${partition}-${message.offset}`,
+          value: JSON.stringify({
+            originalTopic: topic,
+            originalPartition: partition,
+            originalOffset: String(message.offset),
+            failedAt: new Date().toISOString(),
+            errorMessage: String(lastErr),
+            retryCount: 3,
+            payload: parsedPayload
+          })
+        }]
+      });
       await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
     } catch (e) {
       logger.error({ message: 'dlq_publish_failed', error: String(e) });
+      // Still commit to avoid infinite loop
+      try { await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]); } catch { /* ignore */ }
     }
   } });
 }

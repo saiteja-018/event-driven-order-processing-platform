@@ -292,10 +292,26 @@ async function pollPaymentProcessingQueue() {
   }
 }
 
-start().catch(err => {
-  logger.error({ message: 'startup_error', error: String(err) });
-  process.exit(1);
-});
-
+// Start HTTP server IMMEDIATELY
 const PORT = process.env.PORT || 3003;
 app.listen(PORT, () => logger.info({ message: 'payment-service listening', port: PORT }));
+
+// Start Kafka + SQS poller in background with retry
+async function startWithRetry(maxAttempts = 20, delayMs = 3000) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await start();
+      return;
+    } catch (err) {
+      logger.warn({ message: 'payment_service_start_failed', attempt, error: String(err) });
+      if (attempt < maxAttempts) {
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+  }
+  logger.error({ message: 'payment_service_start_exhausted_retries' });
+}
+
+startWithRetry().catch(err => {
+  logger.error({ message: 'startup_background_error', error: String(err) });
+});

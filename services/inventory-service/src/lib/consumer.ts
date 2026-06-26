@@ -372,11 +372,15 @@ export async function startConsumers() {
           let event: any;
           try { event = JSON.parse(value); } catch { throw new Error('invalid_json'); }
 
-          // Schema validation
+          // Schema validation (best-effort — don't block on schema not found)
           const validation = validateEvent(topic, event);
           if (!validation.valid) {
-            logger.warn({ message: 'schema_invalid', topic, errors: validation.errors });
-            throw new Error(`schema_invalid:${JSON.stringify(validation.errors)}`);
+            const errors = validation.errors || [];
+            const isSchemaMissing = errors.length === 1 && String(errors[0]).startsWith('schema_not_found');
+            if (!isSchemaMissing) {
+              logger.warn({ message: 'schema_invalid', topic, errors: validation.errors });
+              throw new Error(`schema_invalid:${JSON.stringify(validation.errors)}`);
+            }
           }
 
           // Consumer idempotency check

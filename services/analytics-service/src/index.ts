@@ -110,7 +110,7 @@ app.get('/internal/analytics/events', async (req, res) => {
   }
 });
 
-// ── computeHourlyMetrics (also callable via Lambda) ───────────────────────────
+// ── computeHourlyMetrics (also callable via Lambda and HTTP) ──────────────────
 export async function computeHourlyMetrics() {
   const now = new Date();
   // Previous complete hour
@@ -156,81 +156,130 @@ export async function computeHourlyMetrics() {
   );
 
   logger.info({ message: 'hourly_metrics_computed', hourBucket: start.toISOString(), totalOrders, successfulOrders, failedOrders, totalRevenue });
-  return { totalOrders, successfulOrders, failedOrders, totalRevenue, avgOrderValue };
+  return { hourBucket: start.toISOString(), totalOrders, successfulOrders, failedOrders, totalRevenue, avgOrderValue };
 }
 
+// POST /internal/analytics/compute-metrics
+// Manually trigger hourly metrics computation (also invokable by Lambda)
+app.post('/internal/analytics/compute-metrics', async (req, res) => {
+  try {
+    const result = await computeHourlyMetrics();
+    return res.json({ status: 'ok', ...result });
+  } catch (err) {
+    logger.error({ message: 'compute_metrics_error', error: String(err) });
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 // ── Startup ───────────────────────────────────────────────────────────────────
-async function start() {
-  await admin.connect();
-  await consumer.connect();
+async function startKafkaWithRetry(maxAttempts = 20, delayMs = 3000) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await admin.connect();
+      await consumer.connect();
 
-  // Subscribe to all application topics as a regex (avoiding internal binary topics)
-  await consumer.subscribe({ topic: /^(order|inventory|payment|notification|dead\.letter\.queue).*/, fromBeginning: false });
+      // Subscribe to all application topics as a regex (avoiding internal binary topics)
+      await consumer.subscribe({ topic: /^(order|inventory|payment|notification|dead\.letter\.queue).*/, fromBeginning: false });
 
-  await consumer.run({
-    autoCommit: false,
-    eachMessage: async ({ topic, partition, message }) => {
-      try {
-        const value = message.value?.toString() || '{}';
-        let event: any = {};
-        try { event = JSON.parse(value); } catch { event = { raw: value }; }
-
-        // Handle DLQ messages — persist to dead_letter_messages
-        if (topic === 'dead.letter.queue') {
+      await consumer.run({
+        autoCommit: false,
+        eachMessage: async ({ topic, partition, message }) => {
           try {
+            const value = message.value?.toString() || '{}';
+            let event: any = {};
+            try { event = JSON.parse(value); } catch { event = { raw: value }; }
+
+            // Handle DLQ messages — persist to dead_letter_messages
+            if (topic === 'dead.letter.queue') {
+              try {
+                await pool.query(
+                  `INSERT INTO public.dead_letter_messages
+                     (original_topic, original_partition, original_offset, failed_at, error_message, retry_count, payload, created_at)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,now())`,
+                  [
+                    event.originalTopic || null,
+                    event.originalPartition != null ? event.originalPartition : null,
+                    event.originalOffset || null,
+                    event.failedAt ? new Date(event.failedAt) : null,
+                    event.errorMessage || null,
+                    event.retryCount || 0,
+                    event.payload != null ? (typeof event.payload === 'string' ? event.payload : JSON.stringify(event.payload)) : null
+                  ]
+                );
+              } catch (dlqErr) {
+                logger.error({ message: 'dlq_insert_error', error: String(dlqErr) });
+              }
+            }
+
+            // Always insert into order_events_log for every topic
             await pool.query(
-              `INSERT INTO public.dead_letter_messages
-                 (original_topic, original_partition, original_offset, failed_at, error_message, retry_count, payload, created_at)
+              `INSERT INTO analytics_service.order_events_log
+                 (event_type, order_id, user_id, payload, kafka_offset, kafka_partition, kafka_topic, processed_at)
                VALUES ($1,$2,$3,$4,$5,$6,$7,now())`,
               [
-                event.originalTopic || null,
-                event.originalPartition != null ? event.originalPartition : null,
-                event.originalOffset || null,
-                event.failedAt ? new Date(event.failedAt) : null,
-                event.errorMessage || null,
-                event.retryCount || 0,
-                event.payload != null ? (typeof event.payload === 'string' ? event.payload : JSON.stringify(event.payload)) : null
+                event.eventType || event.event_type || topic,
+                event.orderId || event.order_id || null,
+                event.userId || event.user_id || null,
+                event,
+                message.offset ? parseInt(message.offset) : null,
+                partition,
+                topic
               ]
             );
-          } catch (dlqErr) {
-            logger.error({ message: 'dlq_insert_error', error: String(dlqErr) });
+
+            await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
+          } catch (err) {
+            logger.error({ message: 'analytics_consume_error', topic, error: String(err) });
+            // Still commit to avoid getting stuck
+            try {
+              await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
+            } catch { /* ignore */ }
           }
         }
+      });
 
-        // Always insert into order_events_log for every topic
-        await pool.query(
-          `INSERT INTO analytics_service.order_events_log
-             (event_type, order_id, user_id, payload, kafka_offset, kafka_partition, kafka_topic, processed_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,now())`,
-          [
-            event.eventType || event.event_type || topic,
-            event.orderId || event.order_id || null,
-            event.userId || event.user_id || null,
-            event,
-            message.offset ? parseInt(message.offset) : null,
-            partition,
-            topic
-          ]
-        );
-
-        await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
-      } catch (err) {
-        logger.error({ message: 'analytics_consume_error', topic, error: String(err) });
-        // Still commit to avoid getting stuck
-        try {
-          await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
-        } catch { /* ignore */ }
+      logger.info({ message: 'analytics-service kafka started', attempt });
+      return;
+    } catch (err) {
+      logger.warn({ message: 'analytics_kafka_init_failed', attempt, error: String(err) });
+      if (attempt < maxAttempts) {
+        await new Promise(r => setTimeout(r, delayMs));
       }
     }
-  });
+  }
+  logger.error({ message: 'analytics_kafka_init_exhausted_retries' });
+}
+
+async function start() {
+  // Start Kafka with retry (non-blocking after initial connection)
+  await startKafkaWithRetry();
+
+  // Run computeHourlyMetrics on startup and every hour
+  setTimeout(async () => {
+    try {
+      await computeHourlyMetrics();
+      logger.info({ message: 'initial_hourly_metrics_computed' });
+    } catch (err) {
+      logger.warn({ message: 'initial_hourly_metrics_failed', error: String(err) });
+    }
+  }, 5000);
+
+  setInterval(async () => {
+    try {
+      await computeHourlyMetrics();
+    } catch (err) {
+      logger.warn({ message: 'periodic_hourly_metrics_failed', error: String(err) });
+    }
+  }, 60 * 60 * 1000); // every hour
 
   logger.info({ message: 'analytics-service started' });
 }
 
-start().catch(err => {
-  logger.error({ message: 'startup_error', error: String(err) });
-  process.exit(1);
-});
-
+// Start HTTP server immediately
 const PORT = process.env.PORT || 3005;
 app.listen(PORT, () => logger.info({ message: 'analytics-service listening', port: PORT }));
+
+start().catch(err => {
+  logger.error({ message: 'startup_error', error: String(err) });
+  // Don't exit — HTTP server stays up
+});

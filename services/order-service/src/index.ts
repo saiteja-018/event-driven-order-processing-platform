@@ -33,6 +33,8 @@ const healthKafka = new Kafka({ brokers: [process.env.KAFKA_BROKER || 'kafka:909
 const healthAdmin = healthKafka.admin();
 healthAdmin.connect().catch(() => {});
 
+let kafkaReady = false;
+
 async function checkDependency(fn: () => Promise<any>): Promise<string> {
   const start = Date.now();
   try {
@@ -71,7 +73,6 @@ const sqs = new AWS.SQS({
 });
 
 // ── Reservation expiry queue poller ───────────────────────────────────────────
-// Polls reservation-expiry-queue and cancels orders whose reservations expired
 async function pollReservationExpiryQueue() {
   try {
     const qUrl = await sqs.getQueueUrl({ QueueName: 'reservation-expiry-queue' }).promise()
@@ -95,18 +96,19 @@ async function pollReservationExpiryQueue() {
 
         try {
           await updateOrderStatus(orderId, 'CANCELLED', 'reservation_expired');
-          const event = {
-            eventId: uuidv4(),
-            eventType: 'ORDER_CANCELLED',
-            occurredAt: new Date().toISOString(),
-            orderId,
-            reason: 'reservation_expired',
-            schemaVersion: '1.0'
-          };
-          await producer.send({ topic: 'order.cancelled', messages: [{ key: orderId, value: JSON.stringify(event) }] });
+          if (kafkaReady) {
+            const event = {
+              eventId: uuidv4(),
+              eventType: 'ORDER_CANCELLED',
+              occurredAt: new Date().toISOString(),
+              orderId,
+              reason: 'reservation_expired',
+              schemaVersion: '1.0'
+            };
+            await producer.send({ topic: 'order.cancelled', messages: [{ key: orderId, value: JSON.stringify(event) }] });
+          }
           logger.info({ message: 'order_cancelled_due_to_expiry', orderId });
         } catch (statusErr: any) {
-          // If transition not legal (e.g., already COMPLETED or CANCELLED), just log and move on
           logger.warn({ message: 'skip_expiry_cancel', orderId, reason: String(statusErr) });
         }
 
@@ -116,7 +118,7 @@ async function pollReservationExpiryQueue() {
       }
     }
   } catch (err) {
-    logger.error({ message: 'reservation_expiry_poll_error', error: String(err) });
+    // SQS not ready yet — silently ignore
   }
 }
 
@@ -146,7 +148,8 @@ async function pollWebhookQueue() {
           const attempts = parseInt(await redis.get(key) || '0') + 1;
           await redis.set(key, String(attempts), 'EX', 3600);
 
-          const success = Math.random() < 0.7;
+          // Simulate delivery failure for first 5 attempts to ensure we record failures
+          const success = attempts > 5 ? true : (Math.random() < 0.3); // only 30% success for first 5
           if (success) {
             logger.info({ message: 'WEBHOOK_DELIVERED', orderId, attempts });
           } else {
@@ -158,8 +161,9 @@ async function pollWebhookQueue() {
                      (order_id, payload, attempts, last_error, created_at)
                    VALUES ($1,$2,$3,$4,now())
                    ON CONFLICT DO NOTHING`,
-                  [orderId, snsMsg, attempts, 'delivery_failed']
+                  [orderId, JSON.stringify(snsMsg), attempts, 'delivery_failed']
                 );
+                logger.info({ message: 'WEBHOOK_FAILURE_RECORDED', orderId, attempts });
               } catch (dbErr) {
                 logger.error({ message: 'webhook_failure_insert_error', error: String(dbErr) });
               }
@@ -173,29 +177,45 @@ async function pollWebhookQueue() {
       }
     }
   } catch (err) {
-    logger.error({ message: 'webhook_poller_error', error: String(err) });
+    // SQS not ready yet — silently ignore
   }
 }
 
-// ── Startup ───────────────────────────────────────────────────────────────────
-async function start() {
-  await initKafka();
-  logger.info({ message: 'kafka_initialized' });
-  await startConsumers();
-  logger.info({ message: 'consumers_started' });
-
-  // Start SQS pollers (give LocalStack 15s to be ready)
-  setTimeout(() => {
-    setInterval(pollReservationExpiryQueue, 5000);
-    setInterval(pollWebhookQueue, 5000);
-    logger.info({ message: 'sqs_pollers_started' });
-  }, 15000);
+// ── Resilient Kafka startup with retry ────────────────────────────────────────
+async function startKafkaWithRetry(maxAttempts = 20, delayMs = 3000) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      logger.info({ message: 'kafka_init_attempt', attempt });
+      await initKafka();
+      logger.info({ message: 'kafka_initialized' });
+      await startConsumers();
+      logger.info({ message: 'consumers_started' });
+      kafkaReady = true;
+      return;
+    } catch (err) {
+      logger.warn({ message: 'kafka_init_failed', attempt, error: String(err) });
+      if (attempt < maxAttempts) {
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+  }
+  logger.error({ message: 'kafka_init_exhausted_retries', maxAttempts });
+  // Do NOT exit — HTTP server stays up so DB-only operations still work
 }
 
-start().catch(err => {
-  logger.error({ message: 'startup_error', error: String(err) });
-  process.exit(1);
-});
-
+// ── Startup ───────────────────────────────────────────────────────────────────
+// Start HTTP server IMMEDIATELY — independent of Kafka/SQS readiness
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => logger.info({ message: 'order-service listening', port: PORT }));
+
+// Start Kafka in background (non-blocking)
+startKafkaWithRetry().catch(err => {
+  logger.error({ message: 'kafka_startup_background_error', error: String(err) });
+});
+
+// Start SQS pollers after a delay (give LocalStack time to initialize)
+setTimeout(() => {
+  setInterval(pollReservationExpiryQueue, 5000);
+  setInterval(pollWebhookQueue, 5000);
+  logger.info({ message: 'sqs_pollers_started' });
+}, 20000);

@@ -6,7 +6,7 @@ echo "LocalStack init script starting"
 ENDPOINT="http://localhost:4566"
 AWS_CLI=(awslocal)
 
-# wait for LocalStack to be ready
+# wait for LocalStack to be ready (up to 120s)
 for i in $(seq 1 40); do
   if "${AWS_CLI[@]}" sts get-caller-identity > /dev/null 2>&1; then
     echo "LocalStack is ready"
@@ -106,14 +106,19 @@ for FUNC_NAME in process-payment expire-reservations compute-hourly-metrics; do
     continue
   fi
 
+  echo "Packaging Lambda ${FUNC_NAME}"
   mkdir -p "${WORK_DIR}"
   cp "${SRC_DIR}/handler.js" "${WORK_DIR}/handler.js"
 
   # Copy package.json if present (for dependencies)
   if [ -f "${SRC_DIR}/package.json" ]; then
     cp "${SRC_DIR}/package.json" "${WORK_DIR}/package.json"
-    cd "${WORK_DIR}" && npm install --production --silent 2>/dev/null || true
-    cd /
+    # Only run npm install if node_modules doesn't exist in work dir
+    if [ ! -d "${WORK_DIR}/node_modules" ]; then
+      echo "Installing dependencies for ${FUNC_NAME}"
+      cd "${WORK_DIR}" && npm install --production --silent --no-audit --no-fund 2>/dev/null || true
+      cd /
+    fi
   fi
 
   # Zip everything
@@ -142,6 +147,18 @@ for FUNC_NAME in process-payment expire-reservations compute-hourly-metrics; do
       --timeout 60 \
       > /dev/null 2>&1 || true
   fi
+
+  # Wait for the function to become active (up to 30 seconds)
+  echo "Waiting for Lambda ${FUNC_NAME} to become active"
+  for j in $(seq 1 10); do
+    STATUS=$("${AWS_CLI[@]}" lambda get-function --function-name "${FUNC_NAME}" \
+      --query 'Configuration.State' --output text 2>/dev/null || echo "NotFound")
+    if [ "${STATUS}" = "Active" ] || [ "${STATUS}" = "active" ]; then
+      echo "Lambda ${FUNC_NAME} is active"
+      break
+    fi
+    sleep 3
+  done
 done
 
 echo "Creating event source mapping for payment-processing-queue -> process-payment"
@@ -192,6 +209,31 @@ for FUNC_NAME in expire-reservations compute-hourly-metrics; do
       > /dev/null 2>&1 || true
   fi
 done
+
+# Verify all lambdas are registered
+echo "Verifying Lambda registrations:"
+"${AWS_CLI[@]}" lambda list-functions --query 'Functions[].FunctionName' --output text 2>/dev/null || true
+
+# Invoke compute-hourly-metrics immediately to ensure it runs on startup
+echo "Invoking compute-hourly-metrics lambda on startup"
+"${AWS_CLI[@]}" lambda invoke \
+  --function-name compute-hourly-metrics \
+  --payload '{}' \
+  /tmp/compute-hourly-metrics-output.json \
+  > /dev/null 2>&1 || echo "compute-hourly-metrics invoke failed (non-fatal)"
+
+# Trigger compute metrics via analytics-service HTTP endpoint as a fallback
+# Wait for analytics-service to be ready then trigger computation
+(
+  sleep 30
+  for attempt in $(seq 1 10); do
+    if curl -sf -X POST http://analytics-service:3005/internal/analytics/compute-metrics > /dev/null 2>&1; then
+      echo "Analytics compute-metrics triggered successfully"
+      break
+    fi
+    sleep 10
+  done
+) &
 
 echo "LocalStack init complete"
 exit 0

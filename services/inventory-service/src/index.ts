@@ -64,18 +64,29 @@ app.get('/internal/health', healthHandler);
 // (This is also handled by the order-service, but inventory-service updates the
 //  reservation status. The SQS message is consumed by order-service for cancellation.)
 
-// ── Startup ───────────────────────────────────────────────────────────────────
-async function start() {
-  await initKafka();
-  logger.info({ message: 'inventory-service kafka initialized' });
-  await startConsumers();
-  logger.info({ message: 'inventory-service consumers started' });
-}
-
-start().catch(err => {
-  logger.error({ message: 'startup_error', error: String(err) });
-  process.exit(1);
-});
-
+// Start HTTP server IMMEDIATELY
 const PORT = process.env.PORT || 3002;
 app.listen(PORT, () => logger.info({ message: 'inventory-service listening', port: PORT }));
+
+// Start Kafka consumers in background with retry
+async function startWithRetry(maxAttempts = 20, delayMs = 3000) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await initKafka();
+      logger.info({ message: 'inventory-service kafka initialized', attempt });
+      await startConsumers();
+      logger.info({ message: 'inventory-service consumers started', attempt });
+      return;
+    } catch (err) {
+      logger.warn({ message: 'inventory_service_start_failed', attempt, error: String(err) });
+      if (attempt < maxAttempts) {
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+  }
+  logger.error({ message: 'inventory_service_start_exhausted_retries' });
+}
+
+startWithRetry().catch(err => {
+  logger.error({ message: 'startup_background_error', error: String(err) });
+});

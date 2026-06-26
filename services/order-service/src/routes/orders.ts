@@ -9,6 +9,11 @@ import { publishNotificationDispatch, publishOrderLifecycleSns } from '../lib/no
 
 const router = Router();
 
+// Non-blocking fire-and-forget for non-critical async operations
+function fireAndForget(fn: () => Promise<any>, label: string) {
+  fn().catch(err => logger.warn({ message: `${label}_non_critical_error`, error: String(err) }));
+}
+
 router.post('/internal/orders', async (req, res) => {
   const reqId = (req as any).requestId || uuidv4();
   try {
@@ -48,7 +53,15 @@ router.post('/internal/orders', async (req, res) => {
 
       const orderObj = { id: orderId, userId: body.userId, status: 'PENDING', totalAmount: body.totalAmount, currency: body.currency || 'USD', items: body.items, idempotencyKey: idemKey };
 
-      // Publish order.created event
+      // store idempotency response in Redis immediately
+      await redis.set(idemRedisKey, JSON.stringify(orderObj), 'EX', parseInt(process.env.IDEMPOTENCY_TTL || '86400'));
+
+      logger.info({ requestId: reqId, message: 'order_created', orderId });
+
+      // Return 201 IMMEDIATELY — all downstream publishing is fire-and-forget
+      res.status(201).json(orderObj);
+
+      // Publish order.created event (non-blocking after response)
       const event = {
         eventId: uuidv4(),
         eventType: 'ORDER_CREATED',
@@ -61,17 +74,12 @@ router.post('/internal/orders', async (req, res) => {
         idempotencyKey: idemKey,
         schemaVersion: '1.0'
       };
-      await producer.send({ topic: 'order.created', messages: [{ key: orderId, value: JSON.stringify(event) }] });
 
-      // notify via Kafka and SNS
-      await publishNotificationDispatch({ userId: body.userId, orderId, channel: 'EMAIL', templateKey: 'ORDER_CREATED', payload: { orderId, totalAmount: body.totalAmount, currency: body.currency || 'USD' } });
-      await publishOrderLifecycleSns('ORDER_CREATED', { orderId, userId: body.userId, totalAmount: body.totalAmount, currency: body.currency || 'USD' });
+      fireAndForget(() => producer.send({ topic: 'order.created', messages: [{ key: orderId, value: JSON.stringify(event) }] }), 'order_created_kafka');
+      fireAndForget(() => publishNotificationDispatch({ userId: body.userId, orderId, channel: 'EMAIL', templateKey: 'ORDER_CREATED', payload: { orderId, totalAmount: body.totalAmount, currency: body.currency || 'USD' } }), 'order_created_notification');
+      fireAndForget(() => publishOrderLifecycleSns('ORDER_CREATED', { orderId, userId: body.userId, totalAmount: body.totalAmount, currency: body.currency || 'USD' }), 'order_created_sns');
 
-      // store idempotency response in Redis
-      await redis.set(idemRedisKey, JSON.stringify(orderObj), 'EX', parseInt(process.env.IDEMPOTENCY_TTL || '86400'));
-
-      logger.info({ requestId: reqId, message: 'order_created', orderId });
-      return res.status(201).json(orderObj);
+      return;
     } catch (err) {
       await client.query('ROLLBACK');
       logger.error({ requestId: reqId, message: 'order_create_failed', error: String(err) });
@@ -133,10 +141,14 @@ router.patch('/internal/orders/:orderId/cancel', async (req, res) => {
     const userId = orderRes.rows[0]?.user_id || 'unknown';
     await updateOrderStatus(orderId, 'CANCELLED', 'user_cancelled');
     const event = { eventId: uuidv4(), eventType: 'ORDER_CANCELLED', occurredAt: new Date().toISOString(), orderId, reason: 'user_cancelled', schemaVersion: '1.0' };
-    await producer.send({ topic: 'order.cancelled', messages: [{ key: orderId, value: JSON.stringify(event) }] });
-    await publishNotificationDispatch({ userId, orderId, channel: 'EMAIL', templateKey: 'ORDER_CANCELLED', payload: { orderId, reason: 'user_cancelled' } });
-    await publishOrderLifecycleSns('ORDER_CANCELLED', { orderId, reason: 'user_cancelled' });
-    return res.json({ status: 'ok' });
+
+    res.json({ status: 'ok' });
+
+    fireAndForget(() => producer.send({ topic: 'order.cancelled', messages: [{ key: orderId, value: JSON.stringify(event) }] }), 'order_cancelled_kafka');
+    fireAndForget(() => publishNotificationDispatch({ userId, orderId, channel: 'EMAIL', templateKey: 'ORDER_CANCELLED', payload: { orderId, reason: 'user_cancelled' } }), 'order_cancelled_notification');
+    fireAndForget(() => publishOrderLifecycleSns('ORDER_CANCELLED', { orderId, reason: 'user_cancelled' }), 'order_cancelled_sns');
+
+    return;
   } catch (err) {
     logger.error({ message: 'cancel_order_failed', error: String(err) });
     return res.status(409).json({ error: 'conflict' });

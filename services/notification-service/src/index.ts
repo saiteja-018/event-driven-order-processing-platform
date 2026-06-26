@@ -223,10 +223,26 @@ async function start() {
   logger.info({ message: 'notification-service started' });
 }
 
-start().catch(err => {
-  logger.error({ message: 'startup_error', error: String(err) });
-  process.exit(1);
-});
-
+// Start HTTP server IMMEDIATELY
 const PORT = process.env.PORT || 3004;
 app.listen(PORT, () => logger.info({ message: 'notification-service listening', port: PORT }));
+
+// Start Kafka + SQS pollers in background with retry
+async function startWithRetry(maxAttempts = 20, delayMs = 3000) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await start();
+      return;
+    } catch (err) {
+      logger.warn({ message: 'notification_service_start_failed', attempt, error: String(err) });
+      if (attempt < maxAttempts) {
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+  }
+  logger.error({ message: 'notification_service_start_exhausted_retries' });
+}
+
+startWithRetry().catch(err => {
+  logger.error({ message: 'startup_background_error', error: String(err) });
+});
